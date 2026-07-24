@@ -26,11 +26,17 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: Patch build.zig.zon for Zig 0.16 Enum Literal Syntax
+      - name: Patch Code for Zig 0.16 Compatibility
         run: |
-          # Convert string package name to enum literal (e.g., .name = "ursus" -> .name = .ursus)
-          sed -i 's/\.name = "[a-zA-Z0-9_-]*"/.name = .ursus/g' build.zig.zon || true
-          cat build.zig.zon
+          # In Zig 0.16, GPA syntax/location shifted slightly or requires standard namespace handling.
+          # Let's patch src/main.zig if GeneralPurposeAllocator needs wrapping or namespace adjustment.
+          # Actually, let's see what line 6 looks like and map it to standard heap initialization.
+          sed -i 's/std\.heap\.GeneralPurposeAllocator/std.heap.GeneralPurposeAllocator/g' src/main.zig || true
+          
+          # If GeneralPurposeAllocator was moved to root or requires explicit type configuration in 0.16:
+          # Let's inspect src/main.zig line 6 context:
+          echo "--- src/main.zig head ---"
+          head -n 15 src/main.zig
 
       - name: Build Ursus for Android (ARM64 Musl)
         run: |
