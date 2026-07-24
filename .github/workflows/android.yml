@@ -21,10 +21,16 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Setup Compatible Zig Version (0.12.0)
+      - name: Setup Zig 0.16.0
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.12.0
+          version: 0.16.0
+
+      - name: Patch build.zig.zon for Zig 0.16 compatibility
+        run: |
+          # Fix any unquoted identifiers in build.zig.zon if present
+          sed -i 's/\.name = \.\([a-zA-Z0-9_-]*\)/\.name = "\1"/g' build.zig.zon || true
+          sed -i 's/\.dependency = \.\([a-zA-Z0-9_-]*\)/\.dependency = "\1"/g' build.zig.zon || true
 
       - name: Build Ursus for Android (ARM64 Musl)
         run: |
