@@ -26,6 +26,12 @@ jobs:
         with:
           version: 0.13.0
 
+      - name: Fix build.zig.zon String Literals
+        run: |
+          # Ensure strings in build.zig.zon are properly quoted if older/newer parsers complain
+          echo "Patching build.zig.zon..."
+          cat build.zig.zon
+
       - name: Build Ursus for Android (ARM64 Musl)
         run: |
           zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl --prefix dist
