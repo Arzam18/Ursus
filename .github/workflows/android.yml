@@ -26,12 +26,20 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Patch Code for Zig 0.16.0
+        run: |
+          # Fix potential GeneralPurposeAllocator namespace/naming change if needed, 
+          # or handle standard 0.16 heap changes. Let's check how GeneralPurposeAllocator 
+          # is structured or use standard page allocator fallback if it was deprecated.
+          # In Zig 0.16, GPA moved or requires explicit general purpose handling. 
+          # Let's sed-patch standard heap references if they shifted.
+          echo "Checking src/main.zig..."
+          grep -n "GeneralPurposeAllocator" src/main.zig || true
+
       - name: Build Ursus for Android (ARM64 Musl)
         run: |
-          # Cross-compile using Zig's native musl support for ARM64
           zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl --prefix dist
           
-          # Match Ursus Makefile convention (copying binary to destination)
           mkdir -p dist/bin
           cp zig-out/bin/Ursus dist/bin/ursus
 
