@@ -28,13 +28,8 @@ jobs:
 
       - name: Fix build.zig.zon formatting for current Zig version
         run: |
-          # If the compiler expects a string literal but finds an enum literal (or vice versa), 
-          # this robustly normalizes line 2 of build.zig.zon so compilation can proceed.
-          if grep -q '\.name = \.' build.zig.zon; then
-            sed -i 's/\.name = \.\([a-zA-Z0-9_-]*\)/\.name = "\1"/g' build.zig.zon
-          elif grep -q '\.name = "' build.zig.zon; then
-            sed -i 's/\.name = "\([a-zA-Z0-9_-]*\)"/.name = .\1/g' build.zig.zon
-          fi
+          # Convert string literal name to enum literal as required by modern Zig versions
+          sed -i 's/\.name = "[a-zA-Z0-9_-]*"/.name = .ursus/g' build.zig.zon || true
           cat build.zig.zon
 
       - name: Build Ursus for Android (ARM64 Musl)
