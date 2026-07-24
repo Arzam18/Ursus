@@ -21,17 +21,21 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Setup Zig 0.13.0
+      - name: Setup Zig 0.16.0
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.13.0
+          version: 0.16.0
 
-      - name: Patch build.zig.zon for Zig 0.13 Compatibility
+      - name: Fix build.zig.zon formatting for current Zig version
         run: |
-          # Ensure build.zig.zon uses a format compatible with Zig 0.13.0
-          if [ -f build.zig.zon ]; then
-            sed -i 's/\.minimum_version = .*/\.minimum_version = "0.13.0",/g' build.zig.zon || true
+          # If the compiler expects a string literal but finds an enum literal (or vice versa), 
+          # this robustly normalizes line 2 of build.zig.zon so compilation can proceed.
+          if grep -q '\.name = \.' build.zig.zon; then
+            sed -i 's/\.name = \.\([a-zA-Z0-9_-]*\)/\.name = "\1"/g' build.zig.zon
+          elif grep -q '\.name = "' build.zig.zon; then
+            sed -i 's/\.name = "\([a-zA-Z0-9_-]*\)"/.name = .\1/g' build.zig.zon
           fi
+          cat build.zig.zon
 
       - name: Build Ursus for Android (ARM64 Musl)
         run: |
