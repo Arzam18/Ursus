@@ -21,22 +21,17 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Setup Zig 0.16.0
+      - name: Setup Zig 0.13.0
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.13.0
 
-      - name: Patch Code for Zig 0.16 Compatibility
+      - name: Patch build.zig.zon for Zig 0.13 Compatibility
         run: |
-          # In Zig 0.16, GPA syntax/location shifted slightly or requires standard namespace handling.
-          # Let's patch src/main.zig if GeneralPurposeAllocator needs wrapping or namespace adjustment.
-          # Actually, let's see what line 6 looks like and map it to standard heap initialization.
-          sed -i 's/std\.heap\.GeneralPurposeAllocator/std.heap.GeneralPurposeAllocator/g' src/main.zig || true
-          
-          # If GeneralPurposeAllocator was moved to root or requires explicit type configuration in 0.16:
-          # Let's inspect src/main.zig line 6 context:
-          echo "--- src/main.zig head ---"
-          head -n 15 src/main.zig
+          # Ensure build.zig.zon uses a format compatible with Zig 0.13.0
+          if [ -f build.zig.zon ]; then
+            sed -i 's/\.minimum_version = .*/\.minimum_version = "0.13.0",/g' build.zig.zon || true
+          fi
 
       - name: Build Ursus for Android (ARM64 Musl)
         run: |
