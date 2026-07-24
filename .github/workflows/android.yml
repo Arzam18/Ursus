@@ -26,11 +26,11 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: Patch build.zig.zon for Zig 0.16 compatibility
+      - name: Patch build.zig.zon for Zig 0.16 Enum Literal Syntax
         run: |
-          # Fix any unquoted identifiers in build.zig.zon if present
-          sed -i 's/\.name = \.\([a-zA-Z0-9_-]*\)/\.name = "\1"/g' build.zig.zon || true
-          sed -i 's/\.dependency = \.\([a-zA-Z0-9_-]*\)/\.dependency = "\1"/g' build.zig.zon || true
+          # Convert string package name to enum literal (e.g., .name = "ursus" -> .name = .ursus)
+          sed -i 's/\.name = "[a-zA-Z0-9_-]*"/.name = .ursus/g' build.zig.zon || true
+          cat build.zig.zon
 
       - name: Build Ursus for Android (ARM64 Musl)
         run: |
