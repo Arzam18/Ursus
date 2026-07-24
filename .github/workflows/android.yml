@@ -1,0 +1,47 @@
+name: Build Android
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "*" ]
+  pull_request:
+    branches: [ "*" ]
+
+permissions:
+  contents: write
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Setup Zig 0.16.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build Ursus for Android (ARM64 Musl)
+        run: |
+          # Cross-compile using Zig's native musl support for ARM64
+          zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl --prefix dist
+          
+          # Match Ursus Makefile convention (copying binary to destination)
+          mkdir -p dist/bin
+          cp zig-out/bin/Ursus dist/bin/ursus
+
+      - name: Verify Binary
+        run: |
+          ls -lh dist/bin/
+          file dist/bin/*
+
+      - name: Upload Android Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ursus-android-arm64
+          path: dist/bin/*
