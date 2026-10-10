@@ -1,16 +1,17 @@
 const std = @import("std");
-const brd = @import("board");
-const mvs = @import("moves");
-const fen = @import("fen");
-const srch = @import("search");
-const tt = @import("transposition");
-const eval = @import("eval");
-const pawn_tt = @import("pawn_tt");
-const datagen = @import("datagen");
-const nnue = @import("nnue");
-const perft = @import("perft");
-const tp = @import("tunable_parameters");
-const tb = @import("tb");
+const root = @import("root.zig");
+const brd = root.brd;
+const mvs = root.moves;
+const fen = root.fen;
+const srch = root.search;
+const tt = root.tt;
+const eval = root.eval;
+const datagen = root.datagen;
+const nnue = root.nnue;
+const perft = root.perft;
+const tp = root.tp;
+const tb = root.tb;
+const build_options = root.build_options;
 
 var move_overhead: u64 = 15;
 
@@ -28,7 +29,7 @@ pub const SearchLimits = struct {
     movetime: ?u64 = null,
     infinite: bool = false,
     ponder: bool = false,
-    searchmoves: ?[]mvs.EncodedMove = null,
+    searchmoves: ?[]mvs.Move = null,
 };
 
 pub const UciOption = struct {
@@ -42,17 +43,14 @@ pub const UciOption = struct {
 
 const SearchContext = struct {
     protocol: *UciProtocol,
-    board: *brd.Board,
+    board: *brd.GameState,
     max_depth: ?u8 = null,
-    root_color: brd.Color = .White,
 };
 
 fn searchThreadFn(ctx: *SearchContext) void {
     const protocol = ctx.protocol;
-    const root_color = ctx.root_color;
 
     defer {
-        // Destroy the context using the engine's internal allocator
         protocol.allocator.destroy(ctx.board);
         protocol.allocator.destroy(ctx);
         @atomicStore(bool, &protocol.is_searching, false, .release);
@@ -71,38 +69,22 @@ fn searchThreadFn(ctx: *SearchContext) void {
         std.Thread.sleep(1_000_000); // 1ms
     }
 
-    outputBestMove(protocol, result, root_color) catch |err| {
+    outputBestMove(protocol, ctx.board, result) catch |err| {
         std.debug.print("Output error in search thread: {}\n", .{err});
     };
 }
 
-fn moveToUciStr(protocol: *UciProtocol, move: mvs.EncodedMove, color: brd.Color) ![]const u8 {
-    if (protocol.chess960 and move.castling == 1) {
-        const kingside = (move.end_square % 8) == 6; // g-file = kingside
-        const rook_sq = protocol.board.game_state.rookSquare(color, kingside);
-        const start_file: u8 = move.start_square % 8;
-        const start_rank: u8 = @as(u8, @intCast(move.start_square / 8)) + 1;
-        const rook_file: u8 = @as(u8, @intCast(rook_sq % 8));
-        const rook_rank: u8 = @as(u8, @intCast(rook_sq / 8)) + 1;
-        return std.fmt.allocPrint(protocol.allocator, "{c}{d}{c}{d}", .{
-            'a' + start_file, start_rank,
-            'a' + rook_file,  rook_rank,
-        });
-    }
-    return move.uciToString(protocol.allocator);
-}
-
-fn outputBestMove(protocol: *UciProtocol, result: srch.SearchResult, root_color: brd.Color) !void {
+fn outputBestMove(protocol: *UciProtocol, gs: *const brd.GameState, result: srch.SearchResult) !void {
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    const move_str = try moveToUciStr(protocol, result.move, root_color);
-    defer protocol.allocator.free(move_str);
+    var move_buf: [5]u8 = undefined;
+    const move_str = if (result.move.isNull()) "0000" else mvs.moveToUci(gs, result.move, protocol.chess960, &move_buf);
 
     if (result.pv_length >= 2) {
-        const ponder_str = try result.pv[1].uciToString(protocol.allocator);
-        defer protocol.allocator.free(ponder_str);
+        var ponder_buf: [5]u8 = undefined;
+        const ponder_str = mvs.moveToUci(gs, result.pv[1], protocol.chess960, &ponder_buf);
         try stdout.print("bestmove {s} ponder {s}\n", .{ move_str, ponder_str });
     } else {
         try stdout.print("bestmove {s}\n", .{move_str});
@@ -112,7 +94,7 @@ fn outputBestMove(protocol: *UciProtocol, result: srch.SearchResult, root_color:
 }
 
 pub const UciProtocol = struct {
-    board: brd.Board,
+    board: brd.GameState,
     allocator: std.mem.Allocator,
     debug_mode: bool = false,
     should_quit: bool = false,
@@ -124,6 +106,7 @@ pub const UciProtocol = struct {
     tt_table: tt.TranspositionTable = undefined,
 
     search_thread: ?std.Thread = null,
+    searchmoves_owned: ?[]mvs.Move = null,
     is_pondering: bool = false,
     ponder_limits: SearchLimits = .{},
     ponder_side: brd.Color = .White,
@@ -136,8 +119,10 @@ pub const UciProtocol = struct {
         @memset(std.mem.asBytes(protocol), 0);
 
         protocol.allocator = a;
-        protocol.board.game_state = brd.GameState.init();
+        nnue.initWeights();
+        protocol.board.initInPlace();
         protocol.hash_size_mb = 64;
+        protocol.searchmoves_owned = null;
 
         srch.search_helpers = .empty;
         srch.threads = .empty;
@@ -151,8 +136,6 @@ pub const UciProtocol = struct {
 
         protocol.searcher = searcher_ptr;
 
-        nnue.initWeights();
-
         protocol.tt_table = try tt.TranspositionTable.init(a, protocol.hash_size_mb);
         searcher_ptr.tt_table = &protocol.tt_table;
         protocol.game_ply = 0;
@@ -165,6 +148,7 @@ pub const UciProtocol = struct {
 
     pub fn deinit(self: *UciProtocol) void {
         self.stopSearch();
+        self.clearSearchMoves();
         srch.Searcher.deinitThreading();
         tb.deinit();
         self.searcher.deinit();
@@ -224,15 +208,19 @@ pub const UciProtocol = struct {
             try self.handleGenFens(args);
         } else if (std.mem.eql(u8, commandName, "eval")) {
             const eval_score = self.board.evaluateNNUE();
-            try respond(try std.fmt.allocPrint(self.allocator, "Evaluation: {d}", .{eval_score}));
+            var buf: [64]u8 = undefined;
+            try respond(try std.fmt.bufPrint(&buf, "Evaluation: {d}", .{eval_score}));
         } else if (std.mem.eql(u8, commandName, "perft")) {
             try self.handlePerft(args);
+        } else if (std.mem.eql(u8, commandName, "divide")) {
+            try self.handleDivide(args);
         } else if (std.mem.eql(u8, commandName, "bench")) {
             try self.handleBench(args);
         } else if (std.mem.eql(u8, commandName, "spsa") or std.mem.eql(u8, commandName, "tunables")) {
             try printSpsaInput();
         } else if (std.mem.eql(u8, commandName, "bench-expected")) {
-            try respond(try std.fmt.allocPrint(self.allocator, "{d}", .{EXPECTED_BENCH_NODES}));
+            var buf: [32]u8 = undefined;
+            try respond(try std.fmt.bufPrint(&buf, "{d}", .{EXPECTED_BENCH_NODES}));
         } else {
             if (self.debug_mode) {
                 try respond("Unknown command");
@@ -273,17 +261,46 @@ pub const UciProtocol = struct {
         return if (v > 0) @intCast(v) else 0;
     }
 
+    fn clearSearchMoves(self: *UciProtocol) void {
+        self.searcher.searchmoves = null;
+        for (srch.search_helpers.items) |helper| {
+            helper.searchmoves = null;
+        }
+        if (self.searchmoves_owned) |sm| {
+            self.allocator.free(sm);
+            self.searchmoves_owned = null;
+        }
+    }
+
     fn handleGo(self: *UciProtocol, args: [][]const u8) !void {
         if (self.search_thread != null) {
             self.stopSearch();
         }
+
+        self.clearSearchMoves();
 
         var limits = SearchLimits{};
         var i: usize = 0;
 
         while (i < args.len) {
             const arg = args[i];
+            if (std.mem.eql(u8, arg, "searchmoves")) {
+                i += 1;
+                var sm_list: std.ArrayList(mvs.Move) = .empty;
+                errdefer sm_list.deinit(self.allocator);
 
+                while (i < args.len) : (i += 1) {
+                    const m = self.parseLegalMove(args[i]) orelse break;
+                    try sm_list.append(self.allocator, m);
+                }
+
+                if (sm_list.items.len > 0) {
+                    limits.searchmoves = try sm_list.toOwnedSlice(self.allocator);
+                } else {
+                    sm_list.deinit(self.allocator);
+                }
+                continue;
+            }
             if (std.mem.eql(u8, arg, "wtime") and i + 1 < args.len) {
                 limits.wtime = parseClockMs(args[i + 1]);
                 i += 2;
@@ -317,12 +334,13 @@ pub const UciProtocol = struct {
             } else if (std.mem.eql(u8, arg, "ponder")) {
                 limits.ponder = true;
                 i += 1;
-            } else if (std.mem.eql(u8, arg, "searchmoves")) {
-                i += 1;
             } else {
                 i += 1;
             }
         }
+
+        self.searchmoves_owned = limits.searchmoves;
+        self.searcher.searchmoves = limits.searchmoves;
 
         self.searcher.stop = false;
         self.searcher.time_stop = false;
@@ -339,16 +357,16 @@ pub const UciProtocol = struct {
         if (limits.ponder) {
             var real_limits = limits;
             real_limits.ponder = false;
-            const time_alloc = self.calculateTimeAllocation(&real_limits, self.board.toMove());
+            const time_alloc = self.calculateTimeAllocation(&real_limits, self.board.to_move);
             self.searcher.max_ms = time_alloc.max_ms;
             self.searcher.ideal_ms = time_alloc.ideal_ms;
             self.searcher.force_think = true;
             self.ponder_limits = limits;
-            self.ponder_side = self.board.toMove();
+            self.ponder_side = self.board.to_move;
             @atomicStore(bool, &self.is_pondering, true, .release);
         } else {
             self.searcher.force_think = false;
-            const time_alloc = self.calculateTimeAllocation(&limits, self.board.toMove());
+            const time_alloc = self.calculateTimeAllocation(&limits, self.board.to_move);
             self.searcher.max_ms = time_alloc.max_ms;
             self.searcher.ideal_ms = time_alloc.ideal_ms;
             @atomicStore(bool, &self.is_pondering, false, .release);
@@ -360,9 +378,8 @@ pub const UciProtocol = struct {
 
         ctx.protocol = self;
         ctx.max_depth = if (limits.depth) |d| @as(u8, @intCast(@min(d, 255))) else null;
-        ctx.root_color = self.board.toMove();
 
-        ctx.board = try self.allocator.create(brd.Board);
+        ctx.board = try self.allocator.create(brd.GameState);
         ctx.board.copyFrom(&self.board);
 
         const spawn_config = std.Thread.SpawnConfig{
@@ -373,7 +390,7 @@ pub const UciProtocol = struct {
     }
 
     fn handleUci(self: *UciProtocol) !void {
-        try respond("id name Ursus 1.1.0 " ++ @tagName(nnue.TARGET));
+        try respond("id name Ursus " ++ build_options.version ++ " " ++ @tagName(nnue.TARGET));
         try respond("id author Zander");
 
         try respond("option name Ponder type check default false");
@@ -384,9 +401,11 @@ pub const UciProtocol = struct {
         try respond("option name SyzygyProbeDepth type spin default 1 min 1 max 100");
         try respond("option name Overhead type spin default 15 min 0 max 1000");
         try respond("option name Clear Hash type button");
+        try respond("option name MultiPV type spin default 1 min 1 max 16");
 
-        // off for non dev
-        // try reportTunables();
+        if (build_options.is_dev) {
+            try reportTunables();
+        }
 
         try self.newGame();
 
@@ -425,20 +444,34 @@ pub const UciProtocol = struct {
             }
             self.hash_size_mb = new_size_mb;
 
+            self.stopSearch();
+
             self.tt_table.deinit(self.allocator);
             self.tt_table = try tt.TranspositionTable.init(self.allocator, self.hash_size_mb);
             self.searcher.tt_table = &self.tt_table;
+            for (srch.search_helpers.items) |helper| {
+                helper.tt_table = &self.tt_table;
+            }
         } else if (std.mem.eql(u8, option_name, "Clear Hash")) {
             self.tt_table.reset();
-            if (pawn_tt.pawn_tt_initialized) {
-                pawn_tt.pawn_tt.reset();
-            }
         } else if (std.mem.eql(u8, option_name, "Ponder")) {
             // TODO: ?
+        } else if (std.mem.eql(u8, option_name, "MultiPV")) {
+            if (args.len < name_end + 2) {
+                if (self.debug_mode) {
+                    try respond("Error: MultiPV option requires a value");
+                }
+                return;
+            }
+            const new_multipv = std.fmt.parseInt(usize, args[name_end + 1], 10) catch 1;
+            self.searcher.multi_pv = std.math.clamp(new_multipv, 1, srch.max_multipv);
         } else if (std.mem.eql(u8, option_name, "UCI_Chess960")) {
             if (args.len >= name_end + 2) {
                 self.chess960 = std.mem.eql(u8, args[name_end + 1], "true");
                 self.searcher.chess960 = self.chess960;
+                for (srch.search_helpers.items) |helper| {
+                    helper.chess960 = self.chess960;
+                }
             }
         } else if (std.mem.eql(u8, option_name, "Threads")) {
             if (args.len < name_end + 2) {
@@ -549,29 +582,45 @@ pub const UciProtocol = struct {
     }
 
     pub fn newGame(self: *UciProtocol) !void {
+        self.stopSearch();
+        self.clearSearchMoves();
+
+        const saved_multipv = self.searcher.multi_pv;
+
+        srch.Searcher.deinitThreading();
+        srch.search_helpers = .empty;
+        srch.threads = .empty;
+
+        self.searcher.deinit();
+        self.searcher.* = srch.Searcher{};
+        self.searcher.initInPlace();
+
+        self.searcher.tt_table = &self.tt_table;
+        self.searcher.chess960 = self.chess960;
+        self.searcher.multi_pv = saved_multipv;
+
         self.tt_table.reset();
 
-
-        @memset(std.mem.asBytes(&self.board), 0);
-
-        self.board.game_state = brd.GameState.init();
         fen.setupStartingPosition(&self.board);
-        self.board.refreshNNUE();
+
+        self.game_ply = 0;
         self.is_searching = false;
     }
 
     fn handleBench(self: *UciProtocol, args: [][]const u8) !void {
         const depth: u32 = if (args.len >= 1) std.fmt.parseInt(u32, args[0], 10) catch 13 else 13;
 
+        const saved_multipv = self.searcher.multi_pv;
+        self.searcher.multi_pv = 1;
+        self.searcher.searchmoves = null;
+        defer self.searcher.multi_pv = saved_multipv;
+
         var total_nodes: u64 = 0;
         var timer = try std.time.Timer.start();
 
         for (bench_positions) |fen_str| {
             self.tt_table.reset();
-            @memset(std.mem.asBytes(&self.board), 0);
-            self.board.game_state = brd.GameState.init();
             try fen.parseFEN(&self.board, fen_str);
-            self.board.refreshNNUE();
 
             self.searcher.stop = false;
             self.searcher.max_ms = std.math.maxInt(u64);
@@ -590,6 +639,28 @@ pub const UciProtocol = struct {
         try respond(msg);
     } 
 
+    fn parseLegalMove(self: *UciProtocol, move_str: []const u8) ?mvs.Move {
+        const mg = self.searcher.move_gen;
+        const move = mvs.parseMove(&self.board, move_str, self.chess960) orelse return null;
+        if (!mg.isPseudoLegal(&self.board, move)) return null;
+        const info = mg.legalInfo(&self.board);
+        if (!mg.isLegal(&self.board, move, &info)) return null;
+        return move;
+    }
+
+    fn playMoves(self: *UciProtocol, move_strs: [][]const u8) !void {
+        for (move_strs) |move_str| {
+            const move = self.parseLegalMove(move_str) orelse {
+                if (self.debug_mode) {
+                    try respond("Error: invalid move");
+                }
+                return;
+            };
+            self.board.makeMove(move);
+            self.game_ply += 1;
+        }
+    }
+
     fn handlePosition(self: *UciProtocol, args: [][]const u8) !void {
         if (args.len == 0) {
             if (self.debug_mode) {
@@ -599,25 +670,13 @@ pub const UciProtocol = struct {
         }
 
         if (std.mem.eql(u8, args[0], "startpos")) {
-            @memset(std.mem.asBytes(&self.board), 0);
-
-            self.board.game_state = brd.GameState.init();
             fen.setupStartingPosition(&self.board);
-            self.board.refreshNNUE();
+            self.game_ply = 0;
 
             var j: usize = 1;
             if (j < args.len and std.mem.eql(u8, args[j], "moves")) {
                 j += 1;
-                for (args[j..]) |move_str| {
-                    const move = mvs.parseMove(&self.board, move_str, self.chess960) orelse {
-                        if (self.debug_mode) {
-                            try respond("Error: invalid move");
-                        }
-                        return;
-                    };
-                    mvs.makeMove(&self.board, move);
-                    self.game_ply += 1;
-                }
+                try self.playMoves(args[j..]);
             }
         } else if (std.mem.eql(u8, args[0], "fen")) {
             var fen_parts = try std.ArrayList([]const u8).initCapacity(self.allocator, 32);
@@ -632,7 +691,6 @@ pub const UciProtocol = struct {
             defer self.allocator.free(fen_str);
 
             try fen.parseFEN(&self.board, fen_str);
-            self.board.refreshNNUE();
 
             self.game_ply = 0;
             if (fen_parts.items.len >= 6) {
@@ -645,16 +703,7 @@ pub const UciProtocol = struct {
 
             if (j < args.len and std.mem.eql(u8, args[j], "moves")) {
                 j += 1;
-                for (args[j..]) |move_str| {
-                    const move = mvs.parseMove(&self.board, move_str, self.chess960) orelse {
-                        if (self.debug_mode) {
-                            try respond("Error: invalid move");
-                        }
-                        return;
-                    };
-                    mvs.makeMove(&self.board, move);
-                    self.game_ply += 1;
-                }
+                try self.playMoves(args[j..]);
             }
         } else {
             if (self.debug_mode) {
@@ -706,6 +755,17 @@ pub const UciProtocol = struct {
             return;
         }
         try perft.runPerft(self.searcher.move_gen, &self.board, depth);
+    }
+
+    fn handleDivide(self: *UciProtocol, args: [][]const u8) !void {
+        if (args.len == 0) {
+            if (self.debug_mode) {
+                try respond("Error: divide command requires a depth argument");
+            }
+            return;
+        }
+        const depth = try std.fmt.parseInt(u32, args[0], 10);
+        _ = try perft.divide(self.searcher.move_gen, &self.board, depth, self.chess960);
     }
 
     fn calculateTimeAllocation(self: *const UciProtocol, limits: *const SearchLimits, side_to_move: brd.Color) struct { max_ms: u64, ideal_ms: u64 } {

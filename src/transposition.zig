@@ -1,7 +1,8 @@
 const std = @import("std");
-const zob = @import("zobrist");
-const brd = @import("board");
-const mv = @import("moves");
+const root = @import("root.zig");
+const zob = root.zob;
+const brd = root.brd;
+const mv = root.moves;
 
 pub const default_tt_size_mb = 64;
 pub const kb = 1 << 10;
@@ -18,7 +19,7 @@ pub const Entry = struct {
     hash: zob.ZobristKey = 0,
     eval: i32 = 0,
     static_eval: i32 = 0,
-    move: mv.EncodedMove = mv.EncodedMove.fromU32(0),
+    move: mv.Move = mv.Move.none,
     flag: EstimationType = .None,
     depth: u8 = 0,
     age: u8 = 0,
@@ -31,7 +32,7 @@ pub const Entry = struct {
 //
 //   bits   0-31:  hash key upper (bits 32-63 of zobrist)
 //   bits  32-47:  eval (i16, clamped)
-//   bits  48-63:  move (u16, compressed from u32)
+//   bits  48-63:  move (the 16-bit Move, stored as-is)
 //   bits  64-79:  static_eval (i16, clamped)
 //   bits  80-81:  flag (EstimationType, 2 bits)
 //   bits  82-89:  depth (u8)
@@ -103,7 +104,7 @@ pub const PackedEntry = extern struct {
             .hash = full_hash,
             .eval = @as(i32, eval_),
             .static_eval = @as(i32, static_eval),
-            .move = mv.EncodedMove.fromTTKey(move_u16),
+            .move = mv.Move.fromU16(move_u16),
             .flag = @enumFromInt(flag_bits),
             .depth = depth,
             .age = age,
@@ -152,9 +153,9 @@ pub const PackedEntry = extern struct {
         return ((self.data >> 100) & 1) != 0;
     }
 
-    pub inline fn getMove(self: PackedEntry) mv.EncodedMove {
+    pub inline fn getMove(self: PackedEntry) mv.Move {
         const move_u16: u16 = @truncate(self.data >> 48);
-        return mv.EncodedMove.fromTTKey(move_u16);
+        return mv.Move.fromU16(move_u16);
     }
 };
 
@@ -268,7 +269,7 @@ pub const TranspositionTable = struct {
         const bucket = &self.buckets[self.index(hash)];
         for (&bucket.entries) |*slot| {
             const packed_entry = PackedEntry{ .data = slot.loadPacked() };
-            if (packed_entry.verify(hash) and packed_entry.getFlag() != .None) {
+            if (packed_entry.verify(hash) and packed_entry.verify(hash)) {
                const current_age = self.getAge();
                 if (packed_entry.getAge() != current_age) {
                     const age_mask: u128 = @as(u128, 0xFF) << 90;
@@ -293,10 +294,10 @@ pub const TranspositionTable = struct {
         const current_age = self.getAge();
 
         var best_move = entry.move;
-        
+
         var match_idx: ?usize = null;
         var empty_idx: ?usize = null;
-        
+
         var worst_idx: usize = 0;
         var worst_score: i32 = std.math.maxInt(i32);
 
@@ -306,7 +307,7 @@ pub const TranspositionTable = struct {
             const packed_entry = PackedEntry{ .data = packed_data };
             const flag = packed_entry.getFlag();
 
-            if (flag == .None) {
+            if (packed_data == 0) {
                 empty_idx = i;
                 continue;
             }
@@ -346,7 +347,7 @@ pub const TranspositionTable = struct {
         const new_packed = PackedEntry.pack(
             entry.hash,
             entry.eval,
-            best_move.toTTKey(),
+            best_move.toU16(),
             entry.static_eval,
             entry.flag,
             entry.depth,
@@ -364,9 +365,8 @@ pub const TranspositionTable = struct {
 
         for (self.buckets) |*bucket| {
             for (&bucket.entries) |*item| {
-                const packed_data = item.load(.monotonic);
-                const packed_entry = PackedEntry{ .data = packed_data };
-                if (packed_entry.getFlag() != .None) {
+                const packed_entry = PackedEntry{ .data = item.loadPacked() };
+                if (packed_entry.data != 0) {
                     used += 1;
                 }
             }
@@ -384,4 +384,3 @@ comptime {
         @compileError("Bucket must be exactly 64 bytes to align with CPU cache lines");
     }
 }
-

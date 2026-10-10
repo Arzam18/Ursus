@@ -11,7 +11,9 @@ pub const rfp_depth: i32 = 6;
 pub const se_min_depth: usize = 7;
 pub const lmr_pv_min = 3;
 pub const lmr_non_pv_min = 1;
-
+pub const hindsight_ext_min_red: i32 = 3;
+pub const hindsight_red_min_red: i32 = 2;
+pub const low_ply_size = 5;
 
 pub const Hook = enum { none, quiet_lmr, noisy_lmr };
 
@@ -44,7 +46,9 @@ pub fn TunableArray(comptime T: type, comptime specs: []const Spec) type {
     };
 }
 
-pub var aspiration_window = Tunable(i32, .{ .min = 8, .max = 80 }){ .value = 31 };
+pub var aspiration_window = Tunable(i32, .{ .min = 8, .max = 80 }){ .value = 32 };
+pub var asp_score_div = Tunable(i32, .{ .min = 5000, .max = 40000 }){ .value = 13000 };
+pub var asp_growth = Tunable(i32, .{ .min = 20, .max = 100 }){ .value = 50 };
 
 pub var rfp_mul = Tunable(i32, .{ .min = 15, .max = 120 }){ .value = 45 };
 pub var rfp_improve = Tunable(i32, .{ .min = 15, .max = 130 }){ .value = 52 };
@@ -57,14 +61,17 @@ pub var nmp_beta_div = Tunable(usize, .{ .min = 50, .max = 300 }){ .value = 129 
 pub var razoring_base = Tunable(i32, .{ .min = 100, .max = 600 }){ .value = 282 };
 pub var razoring_mul = Tunable(i32, .{ .min = 20, .max = 180 }){ .value = 61 };
 
-pub var lmp_improve = Tunable(usize, .{ .min = 100, .max = 500 }){ .value = 223 };
-pub var lmp_base = Tunable(usize, .{ .min = 150, .max = 900 }){ .value = 426 };
-pub var lmp_mul = Tunable(usize, .{ .min = 100, .max = 500 }){ .value = 229 };
+pub var lmp_base = Tunable(usize, .{ .min = 100, .max = 800 }){ .value = 300 };
+pub var lmp_mul = Tunable(usize, .{ .min = 30, .max = 200 }){ .value = 100 };
 
-pub var futility_mul = Tunable(i32, .{ .min = 60, .max = 350 }){ .value = 170 };
+pub var futility_base = Tunable(i32, .{ .min = 0, .max = 300 }){ .value = 100 };
+pub var futility_mul = Tunable(i32, .{ .min = 50, .max = 300 }){ .value = 120 };
+pub var futility_hist_div = Tunable(i32, .{ .min = 32, .max = 512 }){ .value = 128 };
+
+pub var see_quiet_mul = Tunable(i32, .{ .min = 5, .max = 60 }){ .value = 25 };
 
 pub var q_see_min = Tunable(i32, .{ .min = -300, .max = 0 }){ .value = -25 };
-pub var q_see_margin = Tunable(i32, .{ .min = -200, .max = 0 }){ .value = -45 };
+pub var q_fut_margin = Tunable(i32, .{ .min = 10, .max = 600 }){ .value = 400 };
 pub var q_delta_margin = Tunable(i32, .{ .min = 50, .max = 500 }){ .value = 213 };
 
 pub var lmr_base = Tunable(i32, .{ .min = 40, .max = 180, .hook = .quiet_lmr }){ .value = 90 };
@@ -73,9 +80,15 @@ pub var lmr_div = Tunable(i32, .{ .min = 100, .max = 350, .hook = .quiet_lmr }){
 pub var lmr_noisy_base = Tunable(i32, .{ .min = -100, .max = 80, .hook = .noisy_lmr }){ .value = -13 };
 pub var lmr_noisy_div = Tunable(i32, .{ .min = 150, .max = 600, .hook = .noisy_lmr }){ .value = 332 };
 
-pub var se_margin = Tunable(i32, .{ .min = 50, .max = 500}){ .value = 300};
+pub var se_margin = Tunable(i32, .{ .min = 50, .max = 500}){ .value = 150};
 
-pub var history_div = Tunable(i32, .{ .min = 2048, .max = 8192 }){ .value = 4107 };
+pub var history_div = Tunable(i32, .{ .min = 2048, .max = 8192 }){ .value = 4098 };
+pub var history_prune_mult = Tunable(i32, .{ .min = 512, .max = 8192 }){ .value = 1536 };
+
+pub var stat_main_weight = Tunable(i32, .{ .min = 128, .max = 2048}){ .value = 1024};
+pub var stat_cont1_weight = Tunable(i32, .{ .min = 128, .max = 2048}){ .value = 512};
+pub var stat_cont2_weight = Tunable(i32, .{ .min = 128, .max = 2048}){ .value = 512};
+pub var stat_cont4_weight = Tunable(i32, .{ .min = 128, .max = 2048}){ .value = 256};
 
 pub var corr_div_bm = Tunable(i32, .{ .min = 4, .max = 24, .c_end = 0.10, .r_end = 0.01 }){ .value = 10 };
 pub var corr_div_nobm = Tunable(i32, .{ .min = 4, .max = 24, .c_end = 0.10, .r_end = 0.01 }){ .value = 9 };
@@ -86,7 +99,8 @@ pub var corr_np_read_weight = Tunable(i32, .{ .min = 32, .max = 320 }){ .value =
 pub var corr_major_read_weight = Tunable(i32, .{ .min = 32, .max = 320 }){ .value = 119 };
 pub var corr_minor_read_weight = Tunable(i32, .{ .min = 32, .max = 320 }){ .value = 117 };
 
-pub var corr_read_divisor = Tunable(i32, .{ .min = 65536, .max = 327680 }){ .value = 156991 };
+pub var corr_read_divisor = Tunable(i32, .{ .min = 1024, .max = 12288 }){ .value = 3072 };
+pub var corr_limit = Tunable(i32, .{ .min = 128, .max = 4096 }){ .value = 1024 };
 
 pub var probcut_margin = Tunable(i32, .{ .min = 100, .max = 500 }){ .value = 259 };
 pub var probcut_improve = Tunable(i32, .{ .min = 400, .max = 2000 }){ .value = 1046 };
@@ -109,6 +123,9 @@ pub var tm_nodetm_base = Tunable(f32, .{ .min = 0.80, .max = 2.20 }){ .value = 1
 pub var tm_nodetm_mul = Tunable(f32, .{ .min = 0.60, .max = 2.20 }){ .value = 1.33 };
 pub var tm_horizon_div = Tunable(u64, .{ .min = 2, .max = 12, .c_end = 0.10, .r_end = 0.01 }){ .value = 5 };
 pub var tm_horizon_min = Tunable(u64, .{ .min = 5, .max = 30, .c_end = 0.50, .r_end = 0.004 }){ .value = 14 };
+pub var tm_score_rise = Tunable(f32, .{ .min = 0.7, .max = 1.4 }){ .value = 0.9 };
+pub var tm_score_drop = Tunable(f32, .{ .min = 1.0, .max = 2.0 }){ .value = 1.5 };
+pub var tm_next_iter_mul = Tunable(u64, .{ .min = 1, .max = 4, .c_end = 0.5, .r_end = 0.01 }){ .value = 2 };
 
 pub var hist_bonus_mul = Tunable(i32, .{ .min = 100, .max = 600 }){ .value = 300 };
 pub var hist_bonus_offset = Tunable(i32, .{ .min = 0, .max = 800 }){ .value = 300 };
@@ -121,7 +138,32 @@ pub var hist_malus_max = Tunable(i32, .{ .min = 500, .max = 3000 }){ .value = 12
 pub var see_weight = Tunable(i32, .{ .min = 10, .max = 200 }){ .value = 100 };
 pub var capthist_div = Tunable(i32, .{ .min = 10, .max = 100 }){ .value = 39 };
 
+pub var scale_pawn = Tunable(i32, .{ .min = 20, .max = 200}){ .value = 48 };
+pub var scale_knight = Tunable(i32, .{ .min = 300, .max = 700}){ .value = 442};
+pub var scale_bishop = Tunable(i32, .{ .min = 300, .max = 700}){ .value = 461};
+pub var scale_rook = Tunable(i32, .{ .min = 400, .max = 1000}){ .value = 637};
+pub var scale_queen = Tunable(i32, .{ .min = 800, .max = 1600}){ .value = 1223};
+
+pub var material_scale_base = Tunable(i32, .{ .min = 10000, .max = 40000}){ .value = 35374};
+pub var material_scale_div = Tunable(i32, .{ .min = 10000, .max = 40000}){ .value = 35374};
+
 pub var fifty_scale_base = Tunable(i32, .{ .min = 120, .max = 400}){ .value = 200};
+
+pub var optimism_base = Tunable(i32, .{ .min = 0, .max = 12000}){ .value = 2024};
+pub var optimism_mat_scale = Tunable(i32, .{ .min = 0, .max = 2048}){ .value = 1005};
+pub var optimism_scale = Tunable(i32, .{ .min = 50, .max = 300}){ .value = 147};
+pub var optimism_stretch = Tunable(i32, .{ .min = 50, .max = 200}){ .value = 101};
+
+pub var see_capture_mul = Tunable(i32, .{ .min = 10, .max = 60 }){ .value = 30 };
+pub var see_capthist_div = Tunable(i32, .{ .min = 8, .max = 64 }){ .value = 16 };
+
+pub var hindsight_red_margin = Tunable(i32, .{ .min = 0, .max = 200 }){ .value = 60 };
+
+pub var butterfly_weight = Tunable(i32, .{ .min = 0, .max = 1024 }){ .value = 512 };
+pub var threat_hist_weight = Tunable(i32, .{ .min = 0, .max = 1024 }){ .value = 512 };
+
+pub var lph_update_scale = Tunable(i32, .{ .min = 128, .max = 2048 }){ .value = 768 };
+pub var lph_order_mul = Tunable(i32, .{ .min = 10, .max = 120 }){ .value = 40};
 
 pub const TunableRef = struct {
     name: []const u8,
