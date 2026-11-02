@@ -1,53 +1,164 @@
-name: Build Android
+name: Build Ursus for Android ARM64
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ "*" ]
-  pull_request:
-    branches: [ "*" ]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build-android:
-    runs-on: ubuntu-latest
+  build-android-arm64:
+    name: Build ARM64 NEON and Dotprod
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout source
         uses: actions/checkout@v4
         with:
-          submodules: recursive
-          fetch-depth: 1
+          fetch-depth: 0
 
-      - name: Setup Zig 0.13.0
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.13.0
-
-      - name: Adapt build.zig.zon for Zig 0.13
+      - name: Install Zig 0.15.2
+        shell: bash
         run: |
-          # Ensure build.zig.zon parses cleanly under 0.13.0 by updating the minimum version string
-          if [ -f build.zig.zon ]; then
-            sed -i 's/\.minimum_version = .*/\.minimum_version = "0.13.0",/g' build.zig.zon || true
-            sed -i 's/\.minimum_version\s*=\s*"[^"]*"/\.minimum_version = "0.13.0"/g' build.zig.zon || true
+          set -euo pipefail
+          ZIG_VERSION="0.15.2"
+          curl --fail --location --retry 3 --retry-all-errors \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+            --output zig.tar.xz
+          tar -xJf zig.tar.xz
+          ZIG_DIR="${GITHUB_WORKSPACE}/zig-x86_64-linux-${ZIG_VERSION}"
+          test -x "${ZIG_DIR}/zig"
+          echo "${ZIG_DIR}" >> "${GITHUB_PATH}"
+          "${ZIG_DIR}/zig" version
+
+      - name: Install AArch64 binary inspection tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes binutils-aarch64-linux-gnu zip
+
+      - name: Download and verify the NNUE network
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p src/nets
+          curl --fail --location --retry 3 --retry-all-errors \
+            --connect-timeout 20 \
+            --output src/nets/Alkaid-ml.bin \
+            https://raw.githubusercontent.com/zchown/UrsusNets/main/Alkaid-ml.bin
+
+          test -s src/nets/Alkaid-ml.bin
+          NET_BYTES="$(stat -c '%s' src/nets/Alkaid-ml.bin)"
+          echo "Downloaded Alkaid-ml.bin: ${NET_BYTES} bytes"
+          if [ "${NET_BYTES}" -lt 20000000 ]; then
+            echo "The NNUE file is unexpectedly small; refusing to compile an incomplete network."
+            exit 1
           fi
+          sha256sum src/nets/Alkaid-ml.bin
+          test -f src/nets/LICENSE-CC-BY-NC-ND-4.0.md
 
-      - name: Build Ursus for Android (ARM64 Musl)
+      - name: Build portable Android ARM64 NEON binary
+        shell: bash
         run: |
-          zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl --prefix dist
-          
-          mkdir -p dist/bin
-          cp zig-out/bin/Ursus dist/bin/ursus
+          set -euo pipefail
+          zig build \
+            -Doptimize=ReleaseFast \
+            -Dtarget=aarch64-linux-musl \
+            -Dcpu=baseline \
+            --summary all
 
-      - name: Verify Binary
+          mkdir -p dist
+          install -m 755 zig-out/bin/Ursus dist/ursus-1.1.0-android-arm64-neon
+
+      - name: Build Android ARM64 Cortex-A76 Dotprod binary
+        shell: bash
         run: |
-          ls -lh dist/bin/
-          file dist/bin/*
+          set -euo pipefail
+          zig build \
+            -Doptimize=ReleaseFast \
+            -Dtarget=aarch64-linux-musl \
+            -Dcpu=cortex_a76 \
+            --summary all
 
-      - name: Upload Android Artifact
+          install -m 755 zig-out/bin/Ursus dist/ursus-1.1.0-android-arm64-v8.2-dotprod
+
+      - name: Verify Android executables
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for BIN in \
+            dist/ursus-1.1.0-android-arm64-neon \
+            dist/ursus-1.1.0-android-arm64-v8.2-dotprod; do
+            echo "===== ${BIN} ====="
+            file "${BIN}"
+            readelf -hW "${BIN}" | grep -E 'Class:|Machine:'
+
+            HEADER="$(readelf -hW "${BIN}")"
+            PROGRAM_HEADERS="$(readelf -lW "${BIN}")"
+            DYNAMIC_SECTION="$(readelf -dW "${BIN}" 2>/dev/null || true)"
+
+            if ! grep -q 'Machine:.*AArch64' <<<"${HEADER}"; then
+              echo "Not an AArch64 executable: ${BIN}"
+              exit 1
+            fi
+            if grep -q 'Requesting program interpreter' <<<"${PROGRAM_HEADERS}"; then
+              echo "Unexpected dynamic interpreter: ${BIN}"
+              exit 1
+            fi
+            if grep -q '(NEEDED)' <<<"${DYNAMIC_SECTION}"; then
+              echo "Unexpected shared-library dependency: ${BIN}"
+              exit 1
+            fi
+
+            BIN_BYTES="$(stat -c '%s' "${BIN}")"
+            echo "Executable size: ${BIN_BYTES} bytes"
+            if [ "${BIN_BYTES}" -lt 20000000 ]; then
+              echo "The embedded NNUE does not appear to be present in ${BIN}."
+              exit 1
+            fi
+          done
+
+          echo "Checking for the ARM SDOT instruction in the Cortex-A76 build..."
+          aarch64-linux-gnu-objdump -d dist/ursus-1.1.0-android-arm64-v8.2-dotprod \
+            > dist/dotprod-disassembly.txt
+          grep -m 1 -E '[[:space:]]sdot[[:space:]]' dist/dotprod-disassembly.txt
+
+      - name: Package binaries and network license
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp src/nets/LICENSE-CC-BY-NC-ND-4.0.md dist/NNUE-LICENSE-CC-BY-NC-ND-4.0.md
+          cat > dist/BUILD-INFO.txt <<'EOF'
+          Ursus 1.1.0 - Android ARM64
+
+          ursus-1.1.0-android-arm64-neon
+            AArch64 baseline with the mandatory ARM NEON/Advanced SIMD path.
+
+          ursus-1.1.0-android-arm64-v8.2-dotprod
+            Cortex-A76 target with ARM Dotprod/SDOT enabled.
+
+          Both executables are built for aarch64-linux-musl and statically linked,
+          with the Alkaid-ml NNUE embedded during compilation. No separate NNUE
+          file is required at runtime. The NNUE license is included separately.
+          EOF
+          sha256sum \
+            dist/ursus-1.1.0-android-arm64-neon \
+            dist/ursus-1.1.0-android-arm64-v8.2-dotprod \
+            > dist/SHA256SUMS
+
+          cd dist
+          zip -9 Ursus-1.1.0-Android-ARM64.zip \
+            ursus-1.1.0-android-arm64-neon \
+            ursus-1.1.0-android-arm64-v8.2-dotprod \
+            NNUE-LICENSE-CC-BY-NC-ND-4.0.md \
+            BUILD-INFO.txt \
+            SHA256SUMS
+
+      - name: Upload Android ARM64 binaries
         uses: actions/upload-artifact@v4
         with:
-          name: ursus-android-arm64
-          path: dist/bin/*
+          name: Ursus-1.1.0-Android-ARM64
+          path: dist/Ursus-1.1.0-Android-ARM64.zip
+          if-no-files-found: error
+          retention-days: 30
