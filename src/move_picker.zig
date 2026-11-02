@@ -5,6 +5,7 @@ const mvs = root.moves;
 const see = root.see;
 const srch = root.search;
 const tp = root.tp;
+const threat = root.threats;
 
 const Move = mvs.Move;
 const GameState = brd.GameState;
@@ -97,19 +98,6 @@ pub const MovePicker = struct {
         self.is_null = is_null;
     }
 
-    pub fn setThreats(self: *MovePicker, t: u64) void {
-        self.threats = t;
-        self.threats_ready = true;
-    }
-
-    fn ensureThreats(self: *MovePicker, s: *srch.Searcher, gs: *const GameState) u64 {
-        if (!self.threats_ready) {
-            self.threats = srch.computeThreats(s.move_gen, gs, gs.to_move.opposite());
-            self.threats_ready = true;
-        }
-        return self.threats;
-    }
-
     pub fn initNoisy(self: *MovePicker, hash_move: Move) void {
         self.reset(hash_move);
         self.noisy_only = true;
@@ -157,16 +145,21 @@ pub const MovePicker = struct {
     fn scoreNoisy(self: *MovePicker, s: *srch.Searcher, gs: *const GameState) void {
         const pos = &gs.cur_position;
         const side = @intFromEnum(gs.to_move);
-        const pawn_value = see.see_values[@intFromEnum(brd.Pieces.Pawn)];
-        const queen_value = see.see_values[@intFromEnum(brd.Pieces.Queen)];
+        const pawn_value = tp.see_values.values[@intFromEnum(brd.Pieces.Pawn)];
+        const queen_value = tp.see_values.values[@intFromEnum(brd.Pieces.Queen)];
         for (self.list.slice(), 0..) |move, i| {
             if (move.isCapture()) {
                 const victim = @intFromEnum(pos.capturedPiece(move).piece);
                 const attacker = @intFromEnum(pos.movedPiece(move).piece);
                 const capthist: i32 = s.capture_history[side][attacker][move.to][victim];
 
-                var score: i32 = tp.see_weight.value * see.see_values[victim] +
+                var score: i32 = tp.see_weight.value * tp.see_values.values[victim] +
                     @divTrunc(capthist * 10, tp.capthist_div.value);
+                if (s.ply == 0) {
+                    const n = s.root_node_counts[move.from][move.to];
+                    if (n > 0) score += @as(i32, @intCast(std.math.log2_int(u64, n))) * tp.root_order_mul_noisy.value;
+                }
+
                 if (isQueenPromo(move)) {
                     score += score_promotion;
                 }
@@ -181,14 +174,24 @@ pub const MovePicker = struct {
     fn scoreQuiets(self: *MovePicker, s: *srch.Searcher, gs: *const GameState) void {
         const pos = &gs.cur_position;
         const side = @intFromEnum(gs.to_move);
-        const threats = self.ensureThreats(s, gs);
+        if (!self.threats_ready) {
+            self.threats = threat.computeThreats(s.move_gen, gs, gs.to_move.opposite());
+            self.threats_ready = true;
+        }
+
         for (self.list.slice(), 0..) |move, i| {
             if (move.isPromo()) {
                 self.scores[i] = -5_000;
                 continue;
             }
 
-            var score: i32 = s.quietHistScore(side, threats, move.from, move.to);
+            var score: i32 = s.quietHistScore(side, self.threats, move.from, move.to);
+
+            if (s.ply == 0) {
+                const n = s.root_node_counts[move.from][move.to];
+                if (n > 0) score += @as(i32, @intCast(std.math.log2_int(u64, n))) * tp.root_order_mul_quiet.value;
+            }
+
             if (s.ply < tp.low_ply_size) {
                 const lph: i32 = s.low_ply_history[s.ply][move.from][move.to];
                 score += @divTrunc(@divTrunc(lph * tp.lph_order_mul.value, 10), @as(i32, @intCast(s.ply + 1)));
@@ -284,7 +287,7 @@ pub const MovePicker = struct {
                         return PickedMove{ .move = m, .stage = .killer_2 };
                     }
                 },
-
+                // I would like to remove feels gross histories should be good enough
                 .counter => {
                     self.stage = .gen_quiet;
                     if (s.ply > 0) {
@@ -346,41 +349,3 @@ pub const MovePicker = struct {
         }
     }
 };
-
-pub fn verifyPicker(s: *srch.Searcher, gs: *const GameState, hash_move: Move) bool {
-    const reference = s.move_gen.generateLegal(gs, .all);
-    var matched: [mvs.max_moves]bool = .{false} ** mvs.max_moves;
-
-    var picker: MovePicker = undefined;
-    picker.init(hash_move, false);
-    var ok = true;
-    var buf: [5]u8 = undefined;
-
-    while (picker.next(s, gs)) |picked| {
-        var found = false;
-        for (reference.slice(), 0..) |ref, i| {
-            if (ref.eql(picked.move)) {
-                if (matched[i]) {
-                    std.debug.print("picker yielded duplicate move (stage {s}): {s}\n", .{ @tagName(picked.stage), picked.move.toUci(&buf) });
-                    ok = false;
-                }
-                matched[i] = true;
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            std.debug.print("picker yielded illegal/unknown move (stage {s}): {s}\n", .{ @tagName(picked.stage), picked.move.toUci(&buf) });
-            ok = false;
-        }
-    }
-
-    for (reference.slice(), 0..) |ref, i| {
-        if (!matched[i]) {
-            std.debug.print("picker missed legal move: {s}\n", .{ref.toUci(&buf)});
-            ok = false;
-        }
-    }
-
-    return ok;
-}

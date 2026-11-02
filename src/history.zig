@@ -13,16 +13,35 @@ const PieceColor = Searcher.PieceColor;
 const max_history: i32 = 16384;
 const max_cap_history: i32 = 16384;
 
-pub inline fn quietHist(s: *Searcher, side: usize, threats: u64, from: usize, to: usize) i32 {
-    return s.quietHistScore(side, threats, from, to);
+pub var quiet_lmr: [64][64]i32 = undefined;
+pub var noisy_lmr: [64][64]i32 = undefined;
+
+pub fn initQuietLMR() [64][64]i32 {
+    const lmr_base_f: f32 = @as(f32, @floatFromInt(tp.lmr_base.value)) / 100.0;
+    const lmr_div_f: f32 = @as(f32, @floatFromInt(tp.lmr_div.value)) / 100.0;
+    var table: [64][64]i32 = undefined;
+    for (0..64) |d| {
+        for (0..64) |m| {
+            const df: f32 = @floatFromInt(@max(d, 1));
+            const mf: f32 = @floatFromInt(@max(m, 1));
+            table[d][m] = @intFromFloat(lmr_base_f + @log(df) * @log(mf) / lmr_div_f);
+        }
+    }
+    return table;
 }
 
-pub inline fn capHist(s: *Searcher, side: usize, attacker: usize, to: usize, captured: usize) i32 {
-    return s.capture_history[side][attacker][to][captured];
-}
-
-pub inline fn contHist(s: *Searcher, prev_pc: usize, prev_to: usize, cur_pc: usize, cur_to: usize) i32 {
-    return s.continuation[prev_pc][prev_to][cur_pc][cur_to];
+pub fn initNoisyLMR() [64][64]i32 {
+    const lmr_base_f: f32 = @as(f32, @floatFromInt(tp.lmr_noisy_base.value)) / 100.0;
+    const lmr_div_f: f32 = @as(f32, @floatFromInt(tp.lmr_noisy_div.value)) / 100.0;
+    var table: [64][64]i32 = undefined;
+    for (0..64) |d| {
+        for (0..64) |m| {
+            const df: f32 = @floatFromInt(@max(d, 1));
+            const mf: f32 = @floatFromInt(@max(m, 1));
+            table[d][m] = @intFromFloat(lmr_base_f + @log(df) * @log(mf) / lmr_div_f);
+        }
+    }
+    return table;
 }
 
 pub fn resetHeuristics(self: *Searcher, total: bool) void {
@@ -36,47 +55,25 @@ pub fn resetHeuristics(self: *Searcher, total: bool) void {
     @memset(std.mem.asBytes(&self.low_ply_history), 0);
 
     if (total) {
+        @memset(std.mem.asBytes(&self.counter_moves), 0);
         @memset(std.mem.asBytes(&self.correction), 0);
         @memset(std.mem.asBytes(&self.np_white_correction), 0);
         @memset(std.mem.asBytes(&self.np_black_correction), 0);
         @memset(std.mem.asBytes(&self.major_correction), 0);
         @memset(std.mem.asBytes(&self.minor_correction), 0);
-    }
-
-    if (total) {
         @memset(std.mem.asBytes(&self.capture_history), 0);
         @memset(std.mem.asBytes(&self.history), 0);
         @memset(std.mem.asBytes(&self.threat_history), 0);
         @memset(std.mem.asBytes(self.continuation), 0);
-    }
-    else {
-        const hist_flat = std.mem.bytesAsSlice(i32, std.mem.asBytes(&self.history));
-        for (hist_flat) |*entry| {
-            entry.* = entry.* - (entry.* >> 2) + 64;
-        }
-
-        const threat_flat = std.mem.bytesAsSlice(i32, std.mem.asBytes(&self.threat_history));
-        for (threat_flat) |*entry| {
-            entry.* = entry.* - (entry.* >> 2) + 64;
-        }
-
-        const cap_flat = std.mem.bytesAsSlice(i16, std.mem.asBytes(&self.capture_history));
-        for (cap_flat) |*entry| {
-            entry.* -= (entry.* >> 2);
-        }
-
-        const cont_flat = std.mem.bytesAsSlice(i16, std.mem.asBytes(self.continuation));
-        for (cont_flat) |*entry| {
-            entry.* -= (entry.* >> 2);
-        }
+        @memset(std.mem.asBytes(self.cont_correction), 0);
     }
 }
 
-pub inline fn historyBonus(depth: i32) i32 {
+inline fn historyBonus(depth: i32) i32 {
     return @max(1, @min(tp.hist_bonus_max.value, tp.hist_bonus_mul.value * depth - tp.hist_bonus_offset.value));
 }
 
-pub inline fn historyMalus(depth: i32) i32 {
+inline fn historyMalus(depth: i32) i32 {
     return @max(0, @min(tp.hist_malus_max.value, tp.hist_malus_mul.value * depth - tp.hist_malus_offset.value));
 }
 
@@ -142,6 +139,7 @@ pub fn updateCorrection(
     corrGravity(&self.np_black_correction[c][@intCast(pos.non_pawn_hash[b] & 16383)], bonus);
     corrGravity(&self.major_correction[c][@intCast(pos.major_hash & 16383)], bonus);
     corrGravity(&self.minor_correction[c][@intCast(pos.minor_hash & 16383)], bonus);
+    if (self.contCorrPtr(2)) |p| corrGravity(p, bonus);
 }
 
 pub fn getCorrection(self: *Searcher, color: brd.Color, gs: *const brd.GameState) i32 {
@@ -159,12 +157,14 @@ pub fn getCorrection(self: *Searcher, color: brd.Color, gs: *const brd.GameState
     const npb_val: i32 = self.np_black_correction[c][@as(usize, @intCast(np_black_corr_idx))];
     const major_val: i32 = self.major_correction[c][@as(usize, @intCast(major_corr_idx))];
     const minor_val: i32 = self.minor_correction[c][@as(usize, @intCast(minor_corr_idx))];
+    const cont_val: i32 = if (self.contCorrPtr(2)) |p| p.* else 0;
 
     const combined: i32 = pawn_val * tp.corr_pawn_read_weight.value +
         npw_val * tp.corr_np_read_weight.value +
         npb_val * tp.corr_np_read_weight.value +
         major_val * tp.corr_major_read_weight.value +
-        minor_val * tp.corr_minor_read_weight.value;
+        minor_val * tp.corr_minor_read_weight.value +
+        cont_val * tp.corr_cont_read_weight.value;
 
     return @divTrunc(combined, tp.corr_read_divisor.value);
 }
@@ -251,7 +251,6 @@ pub fn updateCaptureHistory(
         applyBonus(i16, best_entry, bonus, max_cap_history);
     }
 
-    // Penalize other captures that were tried but didn't cause the cutoff.
     for (other_moves.slice()) |m| {
         if (!m.isCapture() or m.eql(best_move)) continue;
         const attacker = pos.movedPiece(m).piece.idx();
